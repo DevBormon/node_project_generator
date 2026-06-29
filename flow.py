@@ -188,9 +188,9 @@ def tasks_implementation_workflow():
 
     # ── Stage 1: Load system spec ──
     loader >> recheck
-    recheck - "tasks_loader_valid" >> generator
-    recheck - "tasks_loader_repair_json" >> repair_json
-    recheck - "tasks_loader_repair_dependencies" >> repair_deps
+    recheck - "loader_valid" >> generator
+    recheck - "loader_repair_json" >> repair_json
+    recheck - "loader_repair_dependencies" >> repair_deps
 
     repair_json - "done" >> recheck
     repair_json - "error" >> recheck
@@ -198,19 +198,19 @@ def tasks_implementation_workflow():
 
     # ── Stage 2: Generate tasks ──
     generator >> recheck
-    recheck - "tasks_generator_valid" >> prioritizer
-    recheck - "tasks_generator_repair_json" >> repair_json
-    recheck - "tasks_generator_repair_dependencies" >> repair_deps
-    recheck - "tasks_generator_error" >> generator
-    recheck - "tasks_generator_max_attempt_error" >> generator
+    recheck - "generator_valid" >> prioritizer
+    recheck - "generator_repair_json" >> repair_json
+    recheck - "generator_repair_dependencies" >> repair_deps
+    recheck - "generator_error" >> generator
+    recheck - "generator_max_attempt_error" >> generator
 
     # ── Stage 3: Prioritize tasks ──
     prioritizer >> recheck
-    recheck - "tasks_prioritizer_valid" >> critical_path
-    recheck - "tasks_prioritizer_repair_json" >> repair_json
-    recheck - "tasks_prioritizer_repair_dependencies" >> repair_deps
-    recheck - "tasks_prioritizer_error" >> prioritizer
-    recheck - "tasks_prioritizer_max_attempt_error" >> prioritizer
+    recheck - "prioritizer_valid" >> critical_path
+    recheck - "prioritizer_repair_json" >> repair_json
+    recheck - "prioritizer_repair_dependencies" >> repair_deps
+    recheck - "prioritizer_error" >> prioritizer
+    recheck - "prioritizer_max_attempt_error" >> prioritizer
 
     # ── Stage 4: Critical path analysis ──
     critical_path >> recheck
@@ -232,7 +232,6 @@ def tasks_implementation_workflow():
     compiler - "next_flow" >> end
 
     return Flow(start=loader)
-
 
 def setup_workflow():
     planner = SetupPlannerNode()

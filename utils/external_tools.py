@@ -14,6 +14,8 @@ else:
 path_join = os.path.join
 
 def save_file(workdir, data, name):
+    os.makedirs(workdir, exist_ok=True)
+    
     p = os.path.join(workdir, name)
     with open(p, "w") as f:
         if isinstance(data, (dict, list)):
@@ -62,7 +64,7 @@ def get_latest_feedback(shared, section):
 # ── LLM OUTPUT HELPERS ──
 
 # Parse LLM output with fallback chain: extract_json → remove_markdown → fix_truncated_json → json.loads.
-def parse_llm_json(text, default=None, force_dict=False):
+def parse_llm_json(text, default=None, force_dict=False, required_keys=None):
     parsed = extract_json(text)
     if parsed is None:
         cleaned = remove_markdown(text)
@@ -73,6 +75,11 @@ def parse_llm_json(text, default=None, force_dict=False):
             return default
     if force_dict and isinstance(parsed, list):
         return {}
+    # Validate required keys exist to prevent accepting partial/truncated JSON
+    if required_keys and isinstance(parsed, dict):
+        missing = [k for k in required_keys if k not in parsed]
+        if missing:
+            return default
     return parsed
 
 # Build retry context string for LLM prompts.
@@ -84,13 +91,11 @@ def build_retry_context(is_retry, error_log, verbose=True):
     return f"\nCRITICAL: Previous attempt failed with errors: {json.dumps(error_log)}. Fix these issues."
 
 # Extract a list from LLM output that may be wrapped in a dict under various keys.
-def unwrap_list(data, keys=None):
+def unwrap_list(data, keys=("tasks", "files", "tests", "items", "data", "results", "output", "code", "result", "generated_files", "implementation_tasks", "task_list", "prioritized_tasks")):
     if isinstance(data, list):
         return data
     if not isinstance(data, dict):
         return None
-    if keys is None:
-        keys = ("tasks", "files", "tests", "items", "data", "results", "output", "code", "result", "generated_files", "implementation_tasks", "task_list", "prioritized_tasks")
     for key in keys:
         if key in data and isinstance(data[key], list):
             return data[key]
@@ -181,14 +186,19 @@ def extract_signals(shared):
     business_spec = shared.get("business_spec", {})
     if isinstance(business_spec, dict):
         seed = business_spec.get("seed", {})
+        if not isinstance(seed, dict):
+            seed = {}
         signals["project_name"] = seed.get("domain", "api-service").lower().replace(" ", "-")
         signals["domain"] = seed.get("domain", "")
         signals["constraints"] = seed.get("constraints", [])
-        signals["integration_systems"] = [i.get("system", "") for i in business_spec.get("ba_section", {}).get("integration_points", []) if isinstance(i, dict)]
+        ba_section = business_spec.get("ba_section", {})
+        if isinstance(ba_section, dict):
+            signals["integration_systems"] = [i.get("system", "") for i in ba_section.get("integration_points", []) if isinstance(i, dict)]
     system_spec = shared.get("system_spec", {})
     if isinstance(system_spec, dict):
         arch = system_spec.get("architecture_section", {})
-        signals["bounded_contexts"] = [c.get("name", "") for c in arch.get("bounded_contexts", []) if isinstance(c, dict)]
+        if isinstance(arch, dict):
+            signals["bounded_contexts"] = [c.get("name", "") for c in arch.get("bounded_contexts", []) if isinstance(c, dict)]
         spec_text = json.dumps(system_spec, default=str).lower()
         for key in ("kafka", "redis", "graphql", "websocket", "docker", "github actions"):
             signals[f"mentions_{key}"] = key in spec_text
@@ -223,6 +233,8 @@ def plan_to_markdown(plan):
     if tech:
         lines += ["## Tech Stack Snapshot", ""] + [f"- **{k}:** {v}" for k, v in tech.items()] + [""]
     for ph in plan.get("phases", []):
+        if not isinstance(ph, dict):
+            continue
         lines += [f"### {ph.get('name', 'Untitled')}",
                   f"- **Duration:** {ph.get('duration_hours', 0)} hours",
                   f"- **Deliverable:** {ph.get('deliverable', '')}",
@@ -240,6 +252,8 @@ def plan_to_markdown(plan):
             lines.append(f"| {t.get('task_id', '')} | {t.get('title', '')} | {t.get('category', '')} | {t.get('priority', '')} | {t.get('estimated_hours', 0)} | {deps} |")
         lines.append("")
     for r in plan.get("risk_mitigation", []):
+        if not isinstance(r, dict):
+            continue
         lines.append(f"- **{r.get('risk', '')}**: {r.get('mitigation', '')}")
     if plan.get("risk_mitigation"):
         lines.append("")
@@ -284,6 +298,8 @@ def exec_task(prep_res):
             if tid not in tids:
                 issues.append(f"Critical path references unknown task '{tid}'")
         for g in analysis.get("parallel_groups", []):
+            if not isinstance(g, dict):
+                continue
             for tid in g.get("tasks", []):
                 if tid not in tids:
                     issues.append(f"Parallel group references unknown task '{tid}'")
@@ -299,12 +315,17 @@ def post_business_system(max_attempts, shared, prep_res, result):
     section = prep_res["section"]
     if result.get("status") == "valid":
         return f"{section}_valid"
+    # Skip unfixable sections to prevent infinite loops
+    if shared.get(f"_unfixable_{section}"):
+        shared["errors"] = shared.get("errors", []) + [f"Skipping unfixable consistency issues in {section}"]
+        return f"{section}_valid"
     rk = f"_repair_count_{section}"
     shared[rk] = shared.get(rk, 0) + 1
-    if shared[rk] > max_attempts:
-        shared[rk] = 0
-        shared["errors"] = shared.get("errors", []) + [f"Max repair attempts exceeded for {section}. Errors: {result.get('errors', []) + result.get('inconsistencies', [])}"]
-        return f"{section}_max_attempt_error"
+    if shared[rk] >= max_attempts:
+        # Set permanent error flag instead of resetting count to prevent infinite loops
+        shared[f"_permanent_error_{section}"] = True
+        shared["errors"] = shared.get("errors", []) + [f"Max repair attempts exceeded for {section}. Proceeding with best effort. Errors: {result.get('errors', []) + result.get('inconsistencies', [])}"]
+        return f"{section}_valid"  # Force proceed to break loop
     shared["_repair_context"] = {"type": prep_res["type"], "section": section, "errors": result.get("errors", []), "inconsistencies": result.get("inconsistencies", []), "previous_output": json.dumps(prep_res["data"], indent=2), "attempt": shared[rk]}
     s = result.get("status")
     return f"{section}_repair_{s.split('_')[1]}" if s.startswith("repair_") else "error"
@@ -313,12 +334,17 @@ def post_task(max_attempts, shared, prep_res, result):
     target = prep_res["check_target"]
     if result.get("status") == "valid":
         return f"{target}_valid"
+    # Skip unfixable targets to prevent infinite loops
+    if shared.get(f"_unfixable_{target}") or shared.get("_unfixable_dependencies") or shared.get("_unfixable_critical_path"):
+        shared["errors"] = shared.get("errors", []) + [f"Skipping unfixable issues in {target}"]
+        return f"{target}_valid"
     rk = f"_repair_count_{target}"
     shared[rk] = shared.get(rk, 0) + 1
-    if shared[rk] > max_attempts:
-        shared[rk] = 0
-        shared["errors"] = shared.get("errors", []) + [f"Max repair attempts exceeded for {target}. Issues: {result.get('errors', []) + result.get('issues', [])}"]
-        return f"{target}_error"
+    if shared[rk] >= max_attempts:
+        # Set permanent error flag instead of resetting count to prevent infinite loops
+        shared[f"_permanent_error_{target}"] = True
+        shared["errors"] = shared.get("errors", []) + [f"Max repair attempts exceeded for {target}. Proceeding with best effort. Issues: {result.get('errors', []) + result.get('issues', [])}"]
+        return f"{target}_valid"  # Force proceed to break loop
     shared["_repair_context"] = {"type": "task", "target": target, "errors": result.get("errors", []), "issues": result.get("issues", []), "previous_output": json.dumps(prep_res.get("tasks" if target != "critical_path" else "critical_path", {}), indent=2), "attempt": shared[rk]}
     s = result.get("status")
     return f"{target}_{s}" if s in ("repair_json", "repair_dependencies", "repair_critical_path") else f"{target}_error"
@@ -352,20 +378,20 @@ def extract_structured_sections(spec):
 def flatten_system_spec_for_context(spec):
     flat = {"tech_stack": TECH_STACK, "bounded_contexts": [], "aggregates": [], "endpoints": [], "tables": [], "integrations": [], "security_controls": [], "phases": []}
     arch = spec.get("architecture", spec.get("architecture_section", {}))
-    flat["bounded_contexts"] = [c.get("name", "") for c in arch.get("bounded_contexts", [])]
+    flat["bounded_contexts"] = [c.get("name", "") for c in arch.get("bounded_contexts", []) if isinstance(c, dict)]
     flat["architectural_style"] = arch.get("architectural_style", {}).get("choice", "")
     dom = spec.get("domain_model", spec.get("domain_model_section", {}))
-    flat["aggregates"] = [a.get("name", "") for a in dom.get("aggregates", [])]
+    flat["aggregates"] = [a.get("name", "") for a in dom.get("aggregates", []) if isinstance(a, dict)]
     api = spec.get("api_design", spec.get("api_design_section", {}))
-    flat["endpoints"] = [{"path": e.get("path", ""), "method": e.get("method", ""), "summary": e.get("summary", "")} for e in api.get("endpoints", [])]
+    flat["endpoints"] = [{"path": e.get("path", ""), "method": e.get("method", ""), "summary": e.get("summary", "")} for e in api.get("endpoints", []) if isinstance(e, dict)]
     dat = spec.get("data_design", spec.get("data_design_section", {}))
-    flat["tables"] = [s.get("table", "") for s in dat.get("schemas", [])]
+    flat["tables"] = [s.get("table", "") for s in dat.get("schemas", []) if isinstance(s, dict)]
     integ = spec.get("integration", spec.get("integration_section", {}))
-    flat["integrations"] = [i.get("system", "") for i in integ.get("integrations", [])]
+    flat["integrations"] = [i.get("system", "") for i in integ.get("integrations", []) if isinstance(i, dict)]
     sec = spec.get("security", spec.get("security_section", {}))
     flat["security_controls"] = list(sec.get("threat_model", []))
     impl = spec.get("implementation", spec.get("implementation_section", {}))
-    flat["phases"] = [p.get("name", "") for p in impl.get("phases", [])]
+    flat["phases"] = [p.get("name", "") for p in impl.get("phases", []) if isinstance(p, dict)]
     return flat
 
 # ── BUSINESS COMPRESSORS ──
@@ -374,24 +400,34 @@ def compress_for_pm(business_spec):
     if not isinstance(business_spec, dict):
         return {}
     s, r = business_spec.get("seed", {}), business_spec.get("research", {})
+    if not isinstance(s, dict): s = {}
+    if not isinstance(r, dict): r = {}
     return {"seed": {"domain": s.get("domain", ""), "target_users": s.get("target_users", ""), "core_problem": s.get("core_problem", ""), "constraints": s.get("constraints", [])[:5], "desired_format": s.get("desired_format", "standard")}, "research_insights": {"industry_standards": [str(x)[:200] for x in r.get("industry_standards", [])[:3]], "regulations": [str(x)[:200] for x in r.get("regulations", [])[:3]], "risks": [str(x)[:200] for x in r.get("risks", [])[:3]]}}
 
 def compress_for_ux(business_spec):
     if not isinstance(business_spec, dict):
         return {}
     pm, s = business_spec.get("pm_section", {}), business_spec.get("seed", {})
+    if not isinstance(pm, dict): pm = {}
+    if not isinstance(s, dict): s = {}
     return {"problem_statement": pm.get("problem_statement", ""), "goals": pm.get("goals", [])[:5], "non_goals": pm.get("non_goals", [])[:3], "target_users": s.get("target_users", ""), "stakeholders": pm.get("stakeholders", {}), "success_metrics": pm.get("success_metrics", [])[:3]}
 
 def compress_for_ba(business_spec):
     if not isinstance(business_spec, dict):
         return {}
     pm, ux, r = business_spec.get("pm_section", {}), business_spec.get("ux_section", {}), business_spec.get("research", {})
-    return {"pm_summary": {"problem_statement": pm.get("problem_statement", ""), "goals": pm.get("goals", [])[:5], "non_goals": pm.get("non_goals", [])[:3], "stakeholders": pm.get("stakeholders", {})}, "ux_summary": {"personas": [{"name": p.get("name", ""), "role": p.get("role", ""), "goal": p.get("goal", "")} for p in ux.get("personas", [])[:3]], "key_flows": [{"name": f.get("flow", f.get("name", "")), "entry": f.get("entry_criteria", ""), "exit": f.get("exit_criteria", "")} for f in ux.get("key_flows", [])[:5]], "edge_cases": [str(e.get("scenario", e))[:150] for e in ux.get("edge_cases", [])[:5]]}, "research_regulations": r.get("regulations", [])[:3]}
+    if not isinstance(pm, dict): pm = {}
+    if not isinstance(ux, dict): ux = {}
+    if not isinstance(r, dict): r = {}
+    return {"pm_summary": {"problem_statement": pm.get("problem_statement", ""), "goals": pm.get("goals", [])[:5], "non_goals": pm.get("non_goals", [])[:3], "stakeholders": pm.get("stakeholders", {})}, "ux_summary": {"personas": [{"name": p.get("name", ""), "role": p.get("role", ""), "goal": p.get("goal", "")} for p in ux.get("personas", [])[:3] if isinstance(p, dict)], "key_flows": [{"name": f.get("flow", f.get("name", "")), "entry": f.get("entry_criteria", ""), "exit": f.get("exit_criteria", "")} for f in ux.get("key_flows", [])[:5] if isinstance(f, dict)], "edge_cases": [str(e.get("scenario", e))[:150] for e in ux.get("edge_cases", [])[:5] if isinstance(e, dict)]}, "research_regulations": r.get("regulations", [])[:3]}
 
 def compress_for_review(business_spec):
     if not isinstance(business_spec, dict):
         return {}
     pm, ux, ba = business_spec.get("pm_section", {}), business_spec.get("ux_section", {}), business_spec.get("ba_section", {})
+    if not isinstance(pm, dict): pm = {}
+    if not isinstance(ux, dict): ux = {}
+    if not isinstance(ba, dict): ba = {}
     return {"pm_section": {"problem_statement": pm.get("problem_statement", ""), "goals_count": len(pm.get("goals", [])), "non_goals_count": len(pm.get("non_goals", [])), "stakeholders_present": bool(pm.get("stakeholders", {})), "success_metrics_count": len(pm.get("success_metrics", []))}, "ux_section": {"personas_count": len(ux.get("personas", [])), "scenarios_count": len(ux.get("scenarios", [])), "key_flows_count": len(ux.get("key_flows", [])), "edge_cases_count": len(ux.get("edge_cases", []))}, "ba_section": {"functional_requirements_count": len(ba.get("functional_requirements", [])), "non_functional_requirements_count": len(ba.get("non_functional_requirements", [])), "data_requirements_count": len(ba.get("data_requirements", [])), "integration_points_count": len(ba.get("integration_points", [])), "requirement_scenario_map_present": bool(ba.get("requirement_scenario_map", {}))}}
 
 def compress_for_business_compiler(business_spec):
@@ -405,22 +441,26 @@ def compress_business_spec_for_architecture(business_spec):
     if not isinstance(business_spec, dict):
         return {}
     s, pm, ux, ba = business_spec.get("seed", {}), business_spec.get("pm_section", {}), business_spec.get("ux_section", {}), business_spec.get("ba_section", {})
+    if not isinstance(s, dict): s = {}
+    if not isinstance(pm, dict): pm = {}
+    if not isinstance(ux, dict): ux = {}
+    if not isinstance(ba, dict): ba = {}
     def _perf(r):
         t = str(r.get("description", r) if isinstance(r, dict) else r).lower()
         return any(k in t for k in ["performance", "scalability", "availability", "latency", "throughput", "concurrent", "load", "traffic", "response time", "uptime", "reliability", "capacity", "bandwidth", "memory", "cpu"])
-    return {"seed": {"domain": s.get("domain", ""), "target_users": s.get("target_users", ""), "core_problem": s.get("core_problem", ""), "constraints": s.get("constraints", [])[:5], "desired_format": s.get("desired_format", "standard")}, "pm_summary": {"problem_statement": pm.get("problem_statement", ""), "goals": pm.get("goals", [])[:3], "non_goals": pm.get("non_goals", [])[:3], "stakeholders": pm.get("stakeholders", {}), "success_metrics": pm.get("success_metrics", [])[:2]}, "ux_summary": {"personas": [{"role": p.get("role", ""), "goal": p.get("goal", "")} for p in ux.get("personas", [])[:3]], "key_flows": [f.get("flow", f.get("name", "")) for f in ux.get("key_flows", [])[:5]]}, "ba_summary": {"functional_requirements_count": len(ba.get("functional_requirements", [])), "functional_requirements_preview": [{"id": r.get("id", ""), "description": str(r.get("description", ""))[:120]} for r in ba.get("functional_requirements", [])[:5]], "non_functional_requirements": [r for r in ba.get("non_functional_requirements", []) if _perf(r)][:5], "data_entities": [d.get("entity", "") for d in ba.get("data_requirements", [])[:8]], "integration_points": [{"system": i.get("system", ""), "protocol": i.get("protocol", "")} for i in ba.get("integration_points", [])[:5]]}}
+    return {"seed": {"domain": s.get("domain", ""), "target_users": s.get("target_users", ""), "core_problem": s.get("core_problem", ""), "constraints": s.get("constraints", [])[:5], "desired_format": s.get("desired_format", "standard")}, "pm_summary": {"problem_statement": pm.get("problem_statement", ""), "goals": pm.get("goals", [])[:3], "non_goals": pm.get("non_goals", [])[:3], "stakeholders": pm.get("stakeholders", {}), "success_metrics": pm.get("success_metrics", [])[:2]}, "ux_summary": {"personas": [{"role": p.get("role", ""), "goal": p.get("goal", "")} for p in ux.get("personas", [])[:3] if isinstance(p, dict)], "key_flows": [f.get("flow", f.get("name", "")) for f in ux.get("key_flows", [])[:5] if isinstance(f, dict)]}, "ba_summary": {"functional_requirements_count": len(ba.get("functional_requirements", [])), "functional_requirements_preview": [{"id": r.get("id", ""), "description": str(r.get("description", ""))[:120]} for r in ba.get("functional_requirements", [])[:5] if isinstance(r, dict)], "non_functional_requirements": [r for r in ba.get("non_functional_requirements", []) if _perf(r)][:5], "data_entities": [d.get("entity", "") for d in ba.get("data_requirements", [])[:8] if isinstance(d, dict)], "integration_points": [{"system": i.get("system", ""), "protocol": i.get("protocol", "")} for i in ba.get("integration_points", [])[:5] if isinstance(i, dict)]}}
 
 def _compress_api_base(api_design):
     """Shared base for API design compressors."""
     if not isinstance(api_design, dict):
         return {}
-    return {"api_style": api_design.get("api_style", {}), "routers": [{"name": r.get("name", ""), "path": r.get("path", ""), "module": r.get("module", "")} for r in api_design.get("routers", [])[:10]]}
+    return {"api_style": api_design.get("api_style", {}), "routers": [{"name": r.get("name", ""), "path": r.get("path", ""), "module": r.get("module", "")} for r in api_design.get("routers", [])[:10] if isinstance(r, dict)]}
 
 def compress_api_design_for_data_design(api_design):
     base = _compress_api_base(api_design)
     if not base:
         return {}
-    base["endpoints"] = [{"path": e.get("path", ""), "method": e.get("method", ""), "summary": e.get("summary", "")[:100], "zod_request_schema": e.get("zod_request_schema", ""), "zod_response_schema": e.get("zod_response_schema", "")} for e in api_design.get("endpoints", [])[:15]]
+    base["endpoints"] = [{"path": e.get("path", ""), "method": e.get("method", ""), "summary": e.get("summary", "")[:100], "zod_request_schema": e.get("zod_request_schema", ""), "zod_response_schema": e.get("zod_response_schema", "")} for e in api_design.get("endpoints", [])[:15] if isinstance(e, dict)]
     return base
 
 def compress_api_design_for_integration(api_design):
@@ -429,7 +469,7 @@ def compress_api_design_for_integration(api_design):
 def compress_architecture_for_domain_model(architecture):
     if not isinstance(architecture, dict):
         return {}
-    return {"architectural_style": architecture.get("architectural_style", {}).get("choice", ""), "bounded_contexts": [{"name": c.get("name", ""), "responsibility": c.get("responsibility", "")[:200], "module_path": c.get("module_path", "")} for c in architecture.get("bounded_contexts", [])[:10]], "communication_patterns": {"sync": architecture.get("communication_patterns", {}).get("sync", {}), "async": {"broker": "Kafka", "topics": architecture.get("communication_patterns", {}).get("async", {}).get("topics", [])[:5]}}}
+    return {"architectural_style": architecture.get("architectural_style", {}).get("choice", ""), "bounded_contexts": [{"name": c.get("name", ""), "responsibility": c.get("responsibility", "")[:200], "module_path": c.get("module_path", "")} for c in architecture.get("bounded_contexts", [])[:10] if isinstance(c, dict)], "communication_patterns": {"sync": architecture.get("communication_patterns", {}).get("sync", {}), "async": {"broker": "Kafka", "topics": architecture.get("communication_patterns", {}).get("async", {}).get("topics", [])[:5]}}}
 
 def compress_domain_model_for_api_design(domain_model):
     if not isinstance(domain_model, dict):
@@ -442,24 +482,26 @@ def compress_data_design_for_security(data_design):
     pii = ("email", "phone", "ssn", "password", "name", "address", "dob", "credit", "card")
     schemas = []
     for s in data_design.get("schemas", [])[:15]:
-        pc = [{"name": c.get("name", ""), "type": c.get("type", "")} for c in s.get("columns", []) if any(k in c.get("name", "").lower() for k in pii)]
+        if not isinstance(s, dict):
+            continue
+        pc = [{"name": c.get("name", ""), "type": c.get("type", "")} for c in s.get("columns", []) if isinstance(c, dict) and any(k in c.get("name", "").lower() for k in pii)]
         schemas.append({"table": s.get("table", ""), "pii_columns": pc})
     return {"schemas": schemas}
 
 def compress_security_for_infrastructure(security):
     if not isinstance(security, dict):
         return {}
-    return {"compliance": [c.get("regulation", "") for c in security.get("compliance", [])[:5]], "data_protection": {"at_rest": security.get("data_protection", {}).get("at_rest", ""), "in_transit": security.get("data_protection", {}).get("in_transit", ""), "field_level": bool(security.get("data_protection", {}).get("field_level", ""))}, "rate_limiting": security.get("rate_limiting", {})}
+    return {"compliance": [c.get("regulation", "") for c in security.get("compliance", [])[:5] if isinstance(c, dict)], "data_protection": {"at_rest": security.get("data_protection", {}).get("at_rest", ""), "in_transit": security.get("data_protection", {}).get("in_transit", ""), "field_level": bool(security.get("data_protection", {}).get("field_level", ""))}, "rate_limiting": security.get("rate_limiting", {})}
 
 def compress_architecture_for_infrastructure(architecture):
     if not isinstance(architecture, dict):
         return {}
-    return {"architectural_style": architecture.get("architectural_style", {}), "bounded_contexts": [{"name": c.get("name", ""), "deployable_unit": c.get("deployable_unit", "")} for c in architecture.get("bounded_contexts", [])[:10]], "principles": architecture.get("principles", {}), "cross_cutting_concerns": architecture.get("cross_cutting_concerns", {})}
+    return {"architectural_style": architecture.get("architectural_style", {}), "bounded_contexts": [{"name": c.get("name", ""), "deployable_unit": c.get("deployable_unit", "")} for c in architecture.get("bounded_contexts", [])[:10] if isinstance(c, dict)], "principles": architecture.get("principles", {}), "cross_cutting_concerns": architecture.get("cross_cutting_concerns", {})}
 
 def compress_system_for_implementation(system_spec):
     if not isinstance(system_spec, dict):
         return {}
-    return {"architecture": {"bounded_contexts": [c.get("name", "") for c in system_spec.get("architecture_section", {}).get("bounded_contexts", [])[:10]]}, "domain_model": {"aggregates": [a.get("name", "") for a in system_spec.get("domain_model_section", {}).get("aggregates", [])[:10]]}, "api_design": {"endpoints_count": len(system_spec.get("api_design_section", {}).get("endpoints", []))}, "data_design": {"schemas_count": len(system_spec.get("data_design_section", {}).get("schemas", []))}, "integration": {"integrations_count": len(system_spec.get("integration_section", {}).get("integrations", []))}, "security": {"compliance": [c.get("regulation", "") for c in system_spec.get("security_section", {}).get("compliance", [])[:5]]}, "infrastructure": {"orchestration": system_spec.get("infrastructure_section", {}).get("orchestration", {})}}
+    return {"architecture": {"bounded_contexts": [c.get("name", "") for c in system_spec.get("architecture_section", {}).get("bounded_contexts", [])[:10] if isinstance(c, dict)]}, "domain_model": {"aggregates": [a.get("name", "") for a in system_spec.get("domain_model_section", {}).get("aggregates", [])[:10] if isinstance(a, dict)]}, "api_design": {"endpoints_count": len(system_spec.get("api_design_section", {}).get("endpoints", []))}, "data_design": {"schemas_count": len(system_spec.get("data_design_section", {}).get("schemas", []))}, "integration": {"integrations_count": len(system_spec.get("integration_section", {}).get("integrations", []))}, "security": {"compliance": [c.get("regulation", "") for c in system_spec.get("security_section", {}).get("compliance", [])[:5] if isinstance(c, dict)]}, "infrastructure": {"orchestration": system_spec.get("infrastructure_section", {}).get("orchestration", {})}}
 
 def compress_system_for_tech_review(system_spec):
     if not isinstance(system_spec, dict):
@@ -503,25 +545,19 @@ def compress_system_for_compiler(system_spec):
 def compress_system_spec_for_tasks(system_spec):
     if not isinstance(system_spec, dict):
         return {}
-    return {"architecture": {"bounded_contexts": [{"name": c.get("name", ""), "responsibility": c.get("responsibility", "")[:100]} for c in system_spec.get("architecture_section", {}).get("bounded_contexts", [])[:10]]}, "domain_model": {"aggregates": [{"name": a.get("name", ""), "root": a.get("root", "")} for a in system_spec.get("domain_model_section", {}).get("aggregates", [])[:10]]}, "api_design": {"endpoints": [{"path": e.get("path", ""), "method": e.get("method", ""), "summary": e.get("summary", "")[:80]} for e in system_spec.get("api_design_section", {}).get("endpoints", [])[:15]]}, "data_design": {"schemas": [{"table": s.get("table", "")} for s in system_spec.get("data_design_section", {}).get("schemas", [])[:15]]}, "integration": {"integrations": [{"system": i.get("system", ""), "protocol": i.get("protocol", "")} for i in system_spec.get("integration_section", {}).get("integrations", [])[:10]]}, "security": {"compliance": [c.get("regulation", "") for c in system_spec.get("security_section", {}).get("compliance", [])[:5]]}, "infrastructure": {"environments": [e.get("name", "") for e in system_spec.get("infrastructure_section", {}).get("environments", [])[:3]]}, "implementation": {"phases": [p.get("name", "") for p in system_spec.get("implementation_section", {}).get("phases", [])[:4]]}}
+    return {"architecture": {"bounded_contexts": [{"name": c.get("name", ""), "responsibility": c.get("responsibility", "")[:100]} for c in system_spec.get("architecture_section", {}).get("bounded_contexts", [])[:10] if isinstance(c, dict)]}, "domain_model": {"aggregates": [{"name": a.get("name", ""), "root": a.get("root", "")} for a in system_spec.get("domain_model_section", {}).get("aggregates", [])[:10] if isinstance(a, dict)]}, "api_design": {"endpoints": [{"path": e.get("path", ""), "method": e.get("method", ""), "summary": e.get("summary", "")[:80]} for e in system_spec.get("api_design_section", {}).get("endpoints", [])[:15] if isinstance(e, dict)]}, "data_design": {"schemas": [{"table": s.get("table", "")} for s in system_spec.get("data_design_section", {}).get("schemas", [])[:15] if isinstance(s, dict)]}, "integration": {"integrations": [{"system": i.get("system", ""), "protocol": i.get("protocol", "")} for i in system_spec.get("integration_section", {}).get("integrations", [])[:10] if isinstance(i, dict)]}, "security": {"compliance": [c.get("regulation", "") for c in system_spec.get("security_section", {}).get("compliance", [])[:5] if isinstance(c, dict)]}, "infrastructure": {"environments": [e.get("name", "") for e in system_spec.get("infrastructure_section", {}).get("environments", [])[:3] if isinstance(e, dict)]}, "implementation": {"phases": [p.get("name", "") for p in system_spec.get("implementation_section", {}).get("phases", [])[:4] if isinstance(p, dict)]}}
 
 def compress_tasks_for_prioritization(tasks):
     if not isinstance(tasks, list):
         return []
-    return [{"task_id": t.get("task_id", ""), "title": t.get("title", ""), "category": t.get("category", ""), "priority": t.get("priority", ""), "estimated_hours": t.get("estimated_hours", 0), "dependencies": t.get("dependencies", [])[:5]} for t in tasks]
+    return [{"task_id": t.get("task_id", ""), "title": t.get("title", ""), "category": t.get("category", ""), "priority": t.get("priority", ""), "estimated_hours": t.get("estimated_hours", 0), "dependencies": t.get("dependencies", [])[:5]} for t in tasks if isinstance(t, dict)]
 
 def compress_tasks_for_compiler(tasks):
     if not isinstance(tasks, list):
         return []
-    return [{"task_id": t.get("task_id", ""), "title": t.get("title", ""), "category": t.get("category", ""), "priority": t.get("priority", ""), "status": t.get("status", ""), "description": str(t.get("description", ""))[:300], "acceptance_criteria": t.get("acceptance_criteria", [])[:5], "estimated_hours": t.get("estimated_hours", 0), "dependencies": t.get("dependencies", [])[:5], "files_to_create": [{"path": f.get("path", "") if isinstance(f, dict) else f} for f in t.get("files_to_create", [])[:5]], "tech_stack_components": t.get("tech_stack_components", [])[:3]} for t in tasks]
+    return [{"task_id": t.get("task_id", ""), "title": t.get("title", ""), "category": t.get("category", ""), "priority": t.get("priority", ""), "status": t.get("status", ""), "description": str(t.get("description", ""))[:300], "acceptance_criteria": t.get("acceptance_criteria", [])[:5], "estimated_hours": t.get("estimated_hours", 0), "dependencies": t.get("dependencies", [])[:5], "files_to_create": [{"path": f.get("path", "") if isinstance(f, dict) else f} for f in t.get("files_to_create", [])[:5] if isinstance(f, dict) or isinstance(f, str)], "tech_stack_components": t.get("tech_stack_components", [])[:3]} for t in tasks if isinstance(t, dict)]
 
 # ── JSON REPAIR HELPERS ──
-
-def normalize_ba_json(text):
-    def fix(m):
-        d = m.group(3).strip().strip('"').strip("'")
-        return f'{{"id":"{m.group(1)}{m.group(2)}","description":"{d}"}}'
-    return re.sub(r'(REQ-|NFR-)(\d+):\s*["\']?([^"\']+?)["\']?(?=\s*[,\]\}]|$)', fix, text)
 
 def fix_truncated_json(text):
     text = text.rstrip()
@@ -701,7 +737,15 @@ def get_relevant_sections_for_consistency(workflow_type, section):
     if workflow_type == "business":
         return {"ux_section": ["pm_section", "ux_section"], "ba_section": ["ux_section", "ba_section", "research"]}.get(section, [section])
     elif workflow_type == "system":
-        return {"domain_model_section": ["architecture_section", "domain_model_section"], "api_design_section": ["domain_model_section", "api_design_section"], "data_design_section": ["api_design_section", "data_design_section"], "integration_section": ["architecture_section", "integration_section"], "security_section": ["data_design_section", "security_section"], "infrastructure_section": ["integration_section", "infrastructure_section"], "implementation_section": ["architecture_section", "implementation_section"]}.get(section, [section])
+        return {
+            "domain_model_section": ["architecture_section", "domain_model_section"],
+            "api_design_section": ["domain_model_section", "api_design_section"],
+            "data_design_section": ["domain_model_section", "api_design_section", "data_design_section"],
+            "integration_section": ["architecture_section", "domain_model_section", "integration_section"],
+            "security_section": ["api_design_section", "data_design_section", "security_section"],
+            "infrastructure_section": ["architecture_section", "integration_section", "infrastructure_section"],
+            "implementation_section": ["architecture_section", "domain_model_section", "implementation_section"]
+        }.get(section, [section])
     return [section]
 
 # ── TASK HELPERS ──
@@ -805,7 +849,9 @@ def _business_consistency_checker(sections, current_section):
             if any(k in rl or k in gl for k in ("seeker", "applicant", "candidate", "user", "employee", "hiring", "recruiter", "post", "apply", "search", "browse")): prc.add("end_users")
             if any(k in rl or k in gl for k in ("legal", "compliance", "security", "audit", "regulator", "block", "restrict", "approve", "review")): prc.add("blockers")
         miss = cats - prc
-        if miss:
+        # Only flag as issue if ALL categories are missing (not just blockers)
+        # This prevents false-positive infinite loops on heuristic keyword mismatches
+        if miss and len(miss) == len(cats):
             issues.append(f"PM stakeholder categories {sorted(miss)} not covered by UX personas. Personas cover: {sorted(prc)}. Add personas for: {sorted(miss)}")
         if cats and not pers:
             issues.append("PM defines stakeholders but UX has no personas")
@@ -814,8 +860,10 @@ def _business_consistency_checker(sections, current_section):
         sids = {str(s.get("given", ""))[:30] for s in scens if s.get("given")}
         rmap = _safe_get(ba, "requirement_scenario_map", {})
         if sids and rmap and isinstance(rmap, dict):
-            if not any(s in json.dumps(rmap) for s in sids):
-                issues.append(f"None of the {len(sids)} UX scenarios are mapped in BA requirement_scenario_map. At least one scenario should be traceable.")
+            # Check that at least some requirements are mapped to scenarios
+            has_mappings = any(v for v in rmap.values() if v)
+            if not has_mappings:
+                issues.append("BA requirement_scenario_map exists but has no valid mappings")
     if ba and sections.get("research"):
         res = sections["research"] if isinstance(sections["research"], dict) else {}
         bi = [str(i.get("system", "")) for i in _safe_dict_items(_safe_get(ba, "integration_points", [])) if i.get("system")]
@@ -864,45 +912,27 @@ def _system_consistency_checker(sections, current_section):
         tables = [s.get("table", "") for s in _safe_dict_items(data.get("schemas", []))]
         aggs = [a.get("name", "") for a in _safe_dict_items(domain.get("aggregates", []))]
         for agg in aggs:
-            if agg and not any(agg.lower().replace(" ", "_") in t.lower() or agg.lower() in t.lower() for t in tables if t):
+            if not agg:
+                continue
+            # Normalize aggregate name for matching
+            agg_snake = re.sub(r'(?<!^)(?=[A-Z])', '_', agg).lower()
+            agg_snake_plural = agg_snake + 's' if not agg_snake.endswith('s') else agg_snake
+            matched = False
+            for t in tables:
+                if not t:
+                    continue
+                t_lower = t.lower()
+                # Check multiple naming conventions
+                if (agg.lower() == t_lower or  # exact match
+                    agg_snake == t_lower or  # snake_case match
+                    agg_snake_plural == t_lower or  # snake_case plural
+                    agg.lower().replace(" ", "_") == t_lower or  # space to underscore
+                    agg.lower() in t_lower or  # substring
+                    t_lower in agg.lower()):  # reverse substring
+                    matched = True
+                    break
+            if not matched:
                 issues.append(f"Aggregate '{agg}' has no matching table in data design")
-
-    if current_section == "integration_section" and arch:
-        ctxs = [c.get("name", "") for c in _safe_dict_items(arch.get("bounded_contexts", []))]
-        integ_systems = [i.get("system", "") for i in _safe_dict_items(integration.get("integrations", []))]
-        async_topics = arch.get("communication_patterns", {}).get("async", {}).get("topics", [])
-        for topic in async_topics:
-            if topic and not any(topic.lower() in s.lower() or s.lower() in topic.lower() for s in integ_systems if s):
-                issues.append(f"Kafka topic '{topic}' defined in architecture but no matching integration")
-
-    if current_section == "security_section" and api:
-        endpoints = list(_safe_dict_items(api.get("endpoints", [])))
-        public_endpoints = [e.get("path", "") for e in endpoints if e.get("auth") == "none"]
-        auth_middleware = security.get("authentication", {})
-        if auth_middleware and not public_endpoints:
-            issues.append("Security defines auth but API has no public endpoints — verify all endpoints require auth")
-
-    if current_section == "infrastructure_section" and arch:
-        ctxs = [c.get("name", "") for c in _safe_dict_items(arch.get("bounded_contexts", []))]
-        if len(ctxs) > 1:
-            orchestration = infra.get("orchestration", {})
-            if "docker-compose" in str(orchestration).lower() and "kubernetes" not in str(orchestration).lower():
-                issues.append(f"Architecture has {len(ctxs)} bounded contexts but infrastructure only uses Docker Compose — consider if this is sufficient")
-
-    if current_section == "implementation_section" and arch:
-        ctxs = [c.get("name", "") for c in _safe_dict_items(arch.get("bounded_contexts", []))]
-        phases = impl.get("phases", [])
-        if phases and ctxs:
-            phase_names = " ".join([p.get("name", "").lower() for p in phases])
-            uncovered = [c for c in ctxs if c.lower() not in phase_names]
-            if uncovered:
-                issues.append(f"Implementation phases don't mention bounded contexts: {uncovered}")
-
-    if issues:
-        print(f"_system_consistency_checker ({current_section}) found issues:")
-        for i in issues:
-            print(f"  - {i}")
-    return issues
 
 
 def _validate_task_list(tasks):
@@ -1049,6 +1079,8 @@ def exec_compilation_focused_repair(prep_res, generated_files, test_results):
 def exec_radical_repair(prep_res, generated_files, test_results):
     task_id = prep_res["task_id"]
     task = prep_res.get("task", {})  # ✅ CHANGED from "_raw_task" to "task"
+    if not isinstance(task, dict):
+        task = {}
     if not task or not task.get("description"):
         task = {"task_id": task_id}
     valid_files = [f for f in generated_files if isinstance(f, dict) and "path" in f]

@@ -13,7 +13,7 @@ from .external_tools import (
     compress_security_for_infrastructure, compress_architecture_for_infrastructure,
     compress_system_for_implementation, compress_system_for_tech_review, compress_system_for_compiler,
     compress_system_spec_for_tasks, compress_tasks_for_prioritization, compress_tasks_for_compiler,
-    remove_markdown, extract_json, fix_truncated_json, normalize_ba_json,
+    extract_json,
     run_yarn_command, run_shell_command, is_yarn_pnp_ready, scan_project_files, calculate_coverage,
     get_relevant_sections_for_consistency, marked_as_completed, completed_tasks,
     validate_setup_files, detect_language,

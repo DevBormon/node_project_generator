@@ -1,8 +1,7 @@
 from pocketflow import Node
 from utils import (
     call_llm, parse_llm_json, build_retry_context, path_join, save_file,
-    safe_json_loads, get_latest_feedback, extract_json, remove_markdown,
-    fix_truncated_json, compress_business_spec_for_architecture,
+    safe_json_loads, get_latest_feedback, compress_business_spec_for_architecture,
     compress_architecture_for_domain_model, compress_domain_model_for_api_design,
     compress_api_design_for_data_design, compress_api_design_for_integration,
     compress_data_design_for_security, compress_architecture_for_infrastructure,
@@ -11,9 +10,9 @@ from utils import (
     TECH_STACK, ARCHITECT_PROMPT, DOMAIN_MODEL_PROMPT, API_DESIGN_PROMPT,
     DATA_DESIGN_PROMPT, INTEGRATION_PROMPT, SECURITY_PROMPT,
     INFRASTRUCTURE_PROMPT, IMPLEMENTATION_PROMPT, TECH_REVIEW_PROMPT,
-    SYSTEM_COMPILER_PROMPT,
+    SYSTEM_COMPILER_PROMPT
 )
-import json, os, re
+import json, os
 
 
 class BusinessSpecLoaderNode(Node):
@@ -67,7 +66,18 @@ class BusinessSpecLoaderNode(Node):
         if result.get("error"):
             shared["errors"] = shared.get("errors", []) + [result["error"]]
             return "error"
-        shared["business_spec"] = result.get("business_spec", {})
+        bs = result.get("business_spec", {})
+        if isinstance(bs, str):
+            # Try to parse if it's a JSON string
+            try:
+                bs = json.loads(bs)
+            except (json.JSONDecodeError, TypeError):
+                shared["errors"] = shared.get("errors", []) + ["Business spec loader returned string instead of dict"]
+                return "error"
+        if not isinstance(bs, dict):
+            shared["errors"] = shared.get("errors", []) + [f"Business spec loader returned {type(bs).__name__}, expected dict"]
+            return "error"
+        shared["business_spec"] = bs
         return "next"
 
 
@@ -135,15 +145,29 @@ class DomainModelNode(Node):
         return call_llm(DOMAIN_MODEL_PROMPT, prompt, temperature=0.2)
 
     def post(self, shared, prep_res, exec_res):
-        parsed = parse_llm_json(exec_res)
+        parsed = parse_llm_json(exec_res, force_dict=True)
         if parsed is None:
-            print(f"DomainModelNode: ALL extraction strategies failed. Preview: {str(exec_res)[:500]}")
-            shared["errors"] = shared.get("errors", []) + ["Domain modeler returned invalid JSON. Preview: {str(exec_res)[:300]}"]
+            print(f"DomainModelNode: Failed to parse JSON. Preview: {str(exec_res)[:500]}")
+            shared["errors"] = shared.get("errors", []) + ["Domain modeler returned invalid JSON"]
             return "error"
-        if isinstance(parsed, list):
-            parsed = {"aggregates": parsed}
-        if not isinstance(parsed, dict):
-            parsed = {}
+        # Validate required keys
+        if "aggregates" not in parsed:
+            print(f"DomainModelNode: Missing 'aggregates' key")
+            shared["errors"] = shared.get("errors", []) + ["Domain modeler missing 'aggregates' key"]
+            return "error"
+        # Validate aggregates have names matching BA data_entities
+        ba_entities = set()
+        ba = shared.get("business_spec", {})
+        if isinstance(ba, dict):
+            for dr in ba.get("ba_section", {}).get("data_requirements", []):
+                if isinstance(dr, dict) and dr.get("entity"):
+                    ba_entities.add(dr["entity"])
+        if ba_entities:
+            agg_names = {a.get("name", "") for a in parsed.get("aggregates", []) if isinstance(a, dict)}
+            unknown = agg_names - ba_entities - {""}
+            if unknown:
+                print(f"DomainModelNode: Warning - aggregates not in BA entities: {unknown}")
+                # Don't fail, just warn - LLM may need to add sub-aggregates
         shared["domain_model_section"] = parsed
         return "next"
 
@@ -206,7 +230,7 @@ class DataDesignNode(Node):
         if prep_res["existing_data"] and not prep_res["feedback"]:
             return json.dumps(prep_res["existing_data"])
         context = {
-            "business_requirements": {"data_entities": [d.get("entity", "") for d in prep_res["business_spec"].get("ba_section", {}).get("data_requirements", [])[:8]]},
+            "business_requirements": {"data_entities": [d.get("entity", "") for d in prep_res["business_spec"].get("ba_section", {}).get("data_requirements", [])[:8] if isinstance(d, dict)]},
             "architecture": compress_architecture_for_domain_model(prep_res["architecture"]),
             "domain_model": compress_domain_model_for_api_design(prep_res["domain_model"]),
             "api_design": compress_api_design_for_data_design(prep_res["api_design"]),
@@ -245,7 +269,7 @@ class IntegrationNode(Node):
         if prep_res["existing_integration"] and not prep_res["feedback"]:
             return json.dumps(prep_res["existing_integration"])
         context = {
-            "business_integrations": [{"system": i.get("system", ""), "protocol": i.get("protocol", "")} for i in prep_res["business_spec"].get("ba_section", {}).get("integration_points", [])[:5]],
+            "business_integrations": [{"system": i.get("system", ""), "protocol": i.get("protocol", "")} for i in prep_res["business_spec"].get("ba_section", {}).get("integration_points", [])[:5] if isinstance(i, dict)],
             "architecture": compress_architecture_for_domain_model(prep_res["architecture"]),
             "api_design": compress_api_design_for_integration(prep_res["api_design"]),
             "previous_version": prep_res["existing_integration"],
@@ -328,7 +352,7 @@ class InfrastructureNode(Node):
         context = {
             "business_constraints": prep_res["business_spec"].get("seed", {}).get("constraints", [])[:5],
             "architecture": compress_architecture_for_infrastructure(prep_res["architecture"]),
-            "data_design": {"databases": [d.get("choice", "") for d in prep_res["data_design"].get("databases", [])[:3]]},
+            "data_design": {"databases": [d.get("choice", "") for d in prep_res["data_design"].get("databases", [])[:3] if isinstance(d, dict)]},
             "security": compress_security_for_infrastructure(prep_res["security"]),
             "previous_version": prep_res["existing_infra"],
             "feedback_to_address": prep_res["feedback"],
@@ -458,11 +482,13 @@ class TechReviewNode(Node):
                 ]
                 return "pass"
             feedback = review.get("section_feedback", {})
+            if not isinstance(feedback, dict):
+                feedback = {}
             actions = [
                 (s, feedback.get(s, {}).get("score", 0))
                 for s in ("architecture", "domain_model", "api_design", "data_design",
                           "integration", "security", "infrastructure", "implementation")
-                if feedback.get(s, {}).get("score", 0) < self.QUALITY_THRESHOLD
+                if (isinstance(feedback.get(s), dict) and feedback.get(s, {}).get("score", 0) < self.QUALITY_THRESHOLD)
             ]
             if actions:
                 actions.sort(key=lambda x: x[1])
@@ -516,6 +542,10 @@ class SystemCompilerNode(Node):
         return call_llm(SYSTEM_COMPILER_PROMPT, prompt, temperature=0.2)
 
     def post(self, shared, prep_res, exec_res):
+        # Validate exec_res is a string (markdown/json)
+        if not isinstance(exec_res, str):
+            shared["errors"] = shared.get("errors", []) + [f"System compiler returned {type(exec_res).__name__}, expected string"]
+            return "error"
         shared["system_spec"] = exec_res
         try:
             md_path = os.path.join(path_join(shared["workdir"], "doc"), "system_spec.md")

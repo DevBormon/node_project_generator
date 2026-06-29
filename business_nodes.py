@@ -1,11 +1,10 @@
 from pocketflow import Node
 from utils import (
     call_llm, parse_llm_json, build_retry_context, path_join, save_file,
-    get_latest_feedback, extract_json, remove_markdown, fix_truncated_json,
-    normalize_ba_json, compress_for_pm, compress_for_ux, compress_for_ba,
+    get_latest_feedback, compress_for_pm, compress_for_ux, compress_for_ba,
     compress_for_review, compress_for_business_compiler,
     INPUT_PARSER_PROMPT, RESEARCHER_PROMPT, PM_PROMPT, UX_PROMPT, BA_PROMPT,
-    REVIEW_PROMPT, COMPILER_PROMPT,
+    REVIEW_PROMPT, COMPILER_PROMPT
 )
 import json, os
 
@@ -64,6 +63,8 @@ class ResearcherNode(Node):
         print("*" * 70)
         errors = shared.get("errors", [])
         seed = shared.get("seed", {})
+        if not isinstance(seed, dict):
+            seed = {}
         return {
             "domain": seed.get("domain"), "problem": seed.get("core_problem"),
             "existing_research": shared.get("research"),
@@ -194,24 +195,30 @@ class BAAgentNode(Node):
         return call_llm(BA_PROMPT, prompt)
 
     def post(self, shared, prep_res, exec_res):
-        # BA needs normalize_ba_json before fix_truncated_json, so can't use parse_llm_json directly
-        parsed = extract_json(exec_res)
-        if parsed is not None:
-            if isinstance(parsed, list):
-                parsed = {}
-            shared["ba_section"] = parsed
-            return "next"
-        # Fallback: normalize BA pseudo-JSON patterns then fix truncation
-        cleaned = remove_markdown(exec_res)
-        normalized = fix_truncated_json(normalize_ba_json(cleaned))
-        try:
-            shared["ba_section"] = json.loads(normalized)
-            print("[BA] Recovered via normalizer+fixer")
-            return "next"
-        except (json.JSONDecodeError, TypeError):
+        parsed = parse_llm_json(exec_res, force_dict=True)
+        if parsed is None:
             print(f"BAAgentNode: Failed to parse JSON. Preview: {str(exec_res)[:500]}")
             shared["errors"] = shared.get("errors", []) + ["BA agent returned invalid JSON"]
             return "error"
+        # Validate required keys exist
+        required = {"functional_requirements", "non_functional_requirements",
+                    "data_requirements", "integration_points", "requirement_scenario_map"}
+        missing = required - set(parsed.keys())
+        if missing:
+            print(f"BAAgentNode: Missing required keys: {missing}")
+            shared["errors"] = shared.get("errors", []) + [f"BA agent missing keys: {missing}"]
+            return "error"
+        # Validate data_requirements has entity fields
+        data_reqs = parsed.get("data_requirements", [])
+        if not isinstance(data_reqs, list):
+            shared["errors"] = shared.get("errors", []) + ["BA agent: data_requirements must be a list"]
+            return "error"
+        for i, dr in enumerate(data_reqs):
+            if not isinstance(dr, dict) or "entity" not in dr:
+                shared["errors"] = shared.get("errors", []) + [f"BA agent: data_requirements[{i}] missing 'entity' field"]
+                return "error"
+        shared["ba_section"] = parsed
+        return "next"
 
 
 class ReviewAgentNode(Node):
@@ -265,9 +272,11 @@ class ReviewAgentNode(Node):
                 ]
                 return "pass"
             feedback = review.get("section_feedback", {})
+            if not isinstance(feedback, dict):
+                feedback = {}
             actions = [
                 s for s in ("pm", "ux", "ba")
-                if feedback.get(s, {}).get("score", 0) < self.QUALITY_THRESHOLD
+                if (isinstance(feedback.get(s), dict) and feedback.get(s, {}).get("score", 0) < self.QUALITY_THRESHOLD)
             ]
             return actions[0] if actions else "pm"
         except Exception as e:

@@ -52,10 +52,20 @@ class SystemSpecLoaderNode(Node):
         if result.get("error"):
             shared["errors"] = shared.get("errors", []) + [result["error"]]
             return "error"
-        shared["system_spec"] = result["system_spec"]
-        shared["structured_sections"] = result["structured_sections"]
-        shared["flat_context"] = result["flat_context"]
-        shared["_check_target"] = "tasks_loader"
+        spec = result.get("system_spec", {})
+        if isinstance(spec, str):
+            try:
+                spec = json.loads(spec)
+            except (json.JSONDecodeError, TypeError):
+                shared["errors"] = shared.get("errors", []) + ["System spec loader returned string instead of dict"]
+                return "error"
+        if not isinstance(spec, dict):
+            shared["errors"] = shared.get("errors", []) + [f"System spec loader returned {type(spec).__name__}, expected dict"]
+            return "error"
+        shared["system_spec"] = spec
+        shared["structured_sections"] = result.get("structured_sections", {})
+        shared["flat_context"] = result.get("flat_context", {})
+        shared["_check_target"] = "loader"
         return "default"
 
 
@@ -94,12 +104,22 @@ class TaskGeneratorNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         parsed = parse_llm_json(exec_res)
-        extracted_tasks = unwrap_list(parsed)
+        # Use explicit keys to prevent extracting wrong data structure
+        extracted_tasks = unwrap_list(parsed, keys=("tasks", "task_list", "implementation_tasks"))
         if extracted_tasks is None:
             print(f"TaskGeneratorNode: Failed to extract task list. Preview: {str(exec_res)[:500]}")
             shared["errors"] = shared.get("errors", []) + ["Task generator returned unexpected format"]
-        shared["tasks"] = extracted_tasks if extracted_tasks is not None else []
-        shared["_check_target"] = "tasks_generator"
+            return "error"
+        # Validate task structure
+        if not isinstance(extracted_tasks, list) or len(extracted_tasks) == 0:
+            shared["errors"] = shared.get("errors", []) + ["Task generator returned empty or invalid task list"]
+            return "error"
+        for i, t in enumerate(extracted_tasks[:3]):  # Check first 3
+            if not isinstance(t, dict) or "task_id" not in t:
+                shared["errors"] = shared.get("errors", []) + [f"Task generator: task[{i}] missing 'task_id'"]
+                return "error"
+        shared["tasks"] = extracted_tasks
+        shared["_check_target"] = "generator"
         return "default"
 
 
@@ -121,19 +141,24 @@ class TaskPrioritizerNode(Node):
         context = {
             "tasks": compress_tasks_for_prioritization(prep_res["tasks"]),
             "task_count": len(prep_res["tasks"]),
-            "categories_present": list(set(t.get("category", "") for t in prep_res["tasks"])),
+            "categories_present": list(set(t.get("category", "") for t in prep_res["tasks"] if isinstance(t, dict))),
         }
         prompt = f"Prioritize and refine tasks. Context:\n{json.dumps(context, indent=2, default=str)}\n{build_retry_context(prep_res['is_retry'], prep_res['error_log'])}"
         return call_llm(TASK_PRIORITIZER_PROMPT, prompt, temperature=0.2)
 
     def post(self, shared, prep_res, exec_res):
         parsed = parse_llm_json(exec_res)
-        extracted_tasks = unwrap_list(parsed)
+        # Use explicit keys to prevent extracting wrong data structure
+        extracted_tasks = unwrap_list(parsed, keys=("tasks", "task_list", "implementation_tasks"))
         if extracted_tasks is None:
             print(f"TaskPrioritizerNode: Failed to extract task list. Preview: {str(exec_res)[:500]}")
             shared["errors"] = shared.get("errors", []) + ["Task prioritizer returned unexpected format"]
-        shared["tasks"] = extracted_tasks if extracted_tasks is not None else []
-        shared["_check_target"] = "tasks_prioritizer"
+            return "error"
+        if not isinstance(extracted_tasks, list) or len(extracted_tasks) == 0:
+            shared["errors"] = shared.get("errors", []) + ["Task prioritizer returned empty task list"]
+            return "error"
+        shared["tasks"] = extracted_tasks
+        shared["_check_target"] = "prioritizer"
         return "default"
 
 
@@ -166,11 +191,16 @@ class CriticalPathNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         parsed = parse_llm_json(exec_res)
-        extracted_analysis = unwrap_dict(parsed, "critical_path")
+        # Use explicit keys for critical path analysis
+        extracted_analysis = unwrap_dict(parsed, list_key="critical_path")
         if extracted_analysis is None:
             print(f"CriticalPathNode: Unexpected format. Preview: {str(exec_res)[:500]}")
             shared["errors"] = shared.get("errors", []) + ["Critical path analyzer returned unexpected format"]
-        shared["critical_path_analysis"] = extracted_analysis if extracted_analysis is not None else {}
+            return "error"
+        if not isinstance(extracted_analysis, dict):
+            shared["errors"] = shared.get("errors", []) + ["Critical path analyzer returned non-dict"]
+            return "error"
+        shared["critical_path_analysis"] = extracted_analysis
         shared["_check_target"] = "critical_path"
         return "default"
 
@@ -194,7 +224,7 @@ class TaskCompilerNode(Node):
     def exec(self, prep_res):
         if not prep_res["tasks"]:
             return json.dumps({})
-        total_hours = sum(t.get("estimated_hours", 0) for t in prep_res["tasks"])
+        total_hours = sum(t.get("estimated_hours", 0) for t in prep_res["tasks"] if isinstance(t, dict))
         category_order = ["setup", "infrastructure", "database", "domain_model", "api", "integration", "security", "middleware", "testing", "deployment", "documentation"]
         category_map = {cat: [] for cat in category_order}
         for t in prep_res["tasks"]:
@@ -206,7 +236,7 @@ class TaskCompilerNode(Node):
             task_ids = category_map[cat]
             if task_ids:
                 cat_tasks = [t for t in prep_res["tasks"] if t["task_id"] in task_ids]
-                phases.append({"name": f"Phase: {cat.replace('_', ' ').title()}", "tasks": task_ids, "duration_hours": sum(t.get("estimated_hours", 0) for t in cat_tasks), "deliverable": f"Complete {cat.replace('_', ' ')} implementation"})
+                phases.append({"name": f"Phase: {cat.replace('_', ' ').title()}", "tasks": task_ids, "duration_hours": sum(t.get("estimated_hours", 0) for t in cat_tasks if isinstance(t, dict)), "deliverable": f"Complete {cat.replace('_', ' ')} implementation"})
         context = {
             "tasks": compress_tasks_for_compiler(prep_res["tasks"]),
             "critical_path": prep_res["critical_path"], "phases": phases,
@@ -218,11 +248,16 @@ class TaskCompilerNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         parsed = parse_llm_json(exec_res)
-        extracted_plan = unwrap_dict(parsed)
+        # Use explicit keys for implementation plan
+        extracted_plan = unwrap_dict(parsed, list_key="implementation_plan")
         if extracted_plan is None:
             print(f"TaskCompilerNode: Unexpected format. Preview: {str(exec_res)[:500]}")
             shared["errors"] = shared.get("errors", []) + ["Task compiler returned unexpected format"]
-        shared["implementation_plan"] = extracted_plan if extracted_plan is not None else {}
+            return "error"
+        if not isinstance(extracted_plan, dict):
+            shared["errors"] = shared.get("errors", []) + ["Task compiler returned non-dict"]
+            return "error"
+        shared["implementation_plan"] = extracted_plan
         # JSON artifacts
         save_file(path_join(shared["workdir"], "doc"), parsed, "implementation_tasks.json")
         save_file(path_join(shared["workdir"], "doc"), parsed.get("tasks", []) if isinstance(parsed, dict) else [], "tasks_only.json")

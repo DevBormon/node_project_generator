@@ -84,12 +84,18 @@ class RepairJSONNode(Node):
         workflow_type = prep_res["type"]
         section = prep_res.get("section") or prep_res.get("target")
         schema = get_schema(workflow_type, section)
+        attempt = prep_res.get("attempt", 1)
+
+        # Build retry context with section-specific guidance
+        retry_context = f"\nSECTION: {section}\nATTEMPT: {attempt}"
+        if attempt > 1:
+            retry_context += f"\nCRITICAL: Previous {attempt - 1} repair attempts failed. Fix ALL errors, not just syntax."
 
         prompt = REPAIR_JSON_PROMPT.format(
             validation_errors=json.dumps(prep_res["errors"], indent=2),
             previous_output=prep_res["previous_output"],
             required_keys=json.dumps(schema.get("required", []))
-        )
+        ) + retry_context
         return call_llm("You are a JSON repair specialist.", prompt, temperature=0.1)
 
     def post(self, shared, prep_res, exec_res):
@@ -196,11 +202,14 @@ class RepairConsistencyNode(Node):
             print(f"RepairConsistencyNode: WARNING — same inconsistencies seen again for {section}")
             print(f"  Issues: {inconsistencies}")
             if seen.count(inconsistency_signature) >= 2:
-                print(f"  LOOP DETECTED. Breaking to prevent infinite repair.")
+                print(f"  LOOP DETECTED. Preserving state and routing to error.")
                 shared["errors"] = shared.get("errors", []) + [
-                    f"Unfixable consistency issues in {section} (loop detected): {inconsistencies}"
+                    f"Unfixable consistency issues in {section} (loop detected): {inconsistencies}. Manual intervention required."
                 ]
-                return "done"
+                # Set permanent flag to prevent further repair attempts
+                shared[f"_unfixable_{section}"] = True
+                # Preserve seen history for debugging, don't clear
+                return "error"  # Route to error handler, not back to creator
 
         seen.append(inconsistency_signature)
         shared[_seen_key] = seen
@@ -307,13 +316,28 @@ class RepairDependenciesNode(Node):
         if isinstance(exec_res, dict):
             exec_res = json.dumps(exec_res)
 
+        # Loop detection
+        _seen_key = "_seen_dependency_repairs"
+        seen = shared.get(_seen_key, [])
+        issues_sig = json.dumps(sorted(prep_res.get("issues", [])), sort_keys=True)
+        if issues_sig in seen and seen.count(issues_sig) >= 2:
+            print(f"RepairDependenciesNode: LOOP DETECTED. Preserving tasks and routing to error.")
+            shared["errors"] = shared.get("errors", []) + [
+                f"Dependency repair loop detected: {prep_res.get('issues', [])}. Preserving {len(shared.get('tasks', []))} tasks. Manual fix required."
+            ]
+            # Set permanent flag to prevent further repair attempts
+            shared[f"_unfixable_dependencies"] = True
+            # Preserve seen history and tasks for debugging
+            return "error"  # Route to error handler, don't destroy progress
+        seen.append(issues_sig)
+        shared[_seen_key] = seen
+
         try:
             repaired = json.loads(exec_res)
             if isinstance(repaired, list):
                 shared["tasks"] = repaired
             elif isinstance(repaired, dict) and "tasks" in repaired:
                 shared["tasks"] = repaired["tasks"]
-
             return "default"
         except json.JSONDecodeError:
             shared["errors"] = shared.get("errors", []) + [
@@ -350,10 +374,24 @@ class RepairCriticalPathNode(Node):
         if isinstance(exec_res, dict):
             exec_res = json.dumps(exec_res)
 
+        # Loop detection
+        _seen_key = "_seen_critical_path_repairs"
+        seen = shared.get(_seen_key, [])
+        issues_sig = json.dumps(sorted(prep_res.get("issues", [])), sort_keys=True)
+        if issues_sig in seen and seen.count(issues_sig) >= 2:
+            print(f"RepairCriticalPathNode: LOOP DETECTED. Clearing analysis for regeneration.")
+            shared["errors"] = shared.get("errors", []) + [
+                f"Critical path repair loop detected: {prep_res.get('issues', [])}"
+            ]
+            shared["critical_path_analysis"] = {}
+            shared[_seen_key] = []
+            return "error"
+        seen.append(issues_sig)
+        shared[_seen_key] = seen
+
         try:
             repaired = json.loads(exec_res)
             shared["critical_path_analysis"] = repaired
-
             return "repaired"
         except json.JSONDecodeError:
             shared["errors"] = shared.get("errors", []) + [

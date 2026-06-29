@@ -6,12 +6,12 @@ FAIL-STOP DESIGN: When repair is exhausted, the flow HALTS at EndNode.
 All diagnostic state is preserved in shared for inspection.
 """
 
-import json, os, re
+import json, os
 from pocketflow import Node
 from utils import (
     call_llm, write_file,
     read_file, run_yarn_command, scan_project_files, calculate_coverage,
-    safe_json_loads, extract_json, parse_llm_json, normalize_file_output,
+    safe_json_loads, parse_llm_json, normalize_file_output,
     map_failures_to_sources, failure_fingerprint, code_hash, summarize_failures,
     select_repair_strategy, exec_targeted_repair, exec_holistic_repair,
     exec_compilation_focused_repair, exec_radical_repair, exec_targeted_v2_repair,
@@ -40,6 +40,8 @@ class TaskLoaderNode(Node):
         completed, failed = set(prep_res["completed"]), set(prep_res["failed"])
         next_task = None
         for task in tasks:
+            if not isinstance(task, dict):
+                continue
             tid = task.get("task_id", "")
             print(f"TASK ID: {tid}")
             if tid in completed or tid in failed:
@@ -53,14 +55,20 @@ class TaskLoaderNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         result = safe_json_loads(exec_res, {})
+        if not isinstance(result, dict):
+            shared["errors"] = shared.get("errors", []) + ["Task loader returned invalid format"]
+            return "error"
         if result.get("error"):
             shared["errors"] = shared.get("errors", []) + [result["error"]]
             return "error"
         if result.get("all_complete"):
             shared["_all_tasks_complete"] = True
             return "all_complete"
+        if "task" not in result or not isinstance(result.get("task"), dict):
+            shared["errors"] = shared.get("errors", []) + ["Task loader returned invalid task structure"]
+            return "error"
         shared["current_task"] = result["task"]
-        shared["_task_progress"] = f"{result['completed_count']}/{result['total_tasks']}"
+        shared["_task_progress"] = f"{result.get('completed_count', 0)}/{result.get('total_tasks', 0)}"
         return "default"
 
 
@@ -71,6 +79,8 @@ class CodeGeneratorNode(Node):
         print("CodeGeneratorNode")
         print("*" * 70)
         task = shared.get("current_task", {})
+        if not isinstance(task, dict):
+            task = {}
         output_dir = shared.get("output_dir", shared.get("workdir", "."))
         scan_project_files(output_dir)
         task_id, category = task.get("task_id", ""), task.get("category", "")
@@ -144,14 +154,19 @@ class CodeGeneratorNode(Node):
                 if content:
                     existing_files.append({"path": path, "content": content, "language": "typescript", "purpose": f"Existing file for {task.get('task_id', '')}"})
             shared["generated_files"] = existing_files
-            shared["_code_gen_skipped_existing"] = True  # ← new flag
+            shared["_code_gen_skipped_existing"] = True
             return "default"
         parsed = parse_llm_json(exec_res)
-        files = normalize_file_output(parsed)
-        if files is None:
+        if parsed is None:
             print(f"CodeGeneratorNode: Could not parse LLM output for task {task.get('task_id', '?')}")
             print(f"  Raw preview: {str(exec_res)[:500]}")
             shared["errors"] = shared.get("errors", []) + [f"Code generator returned invalid output for task {task.get('task_id', '?')}"]
+            return "error"
+        files = normalize_file_output(parsed)
+        if files is None:
+            print(f"CodeGeneratorNode: Could not normalize LLM output for task {task.get('task_id', '?')}")
+            print(f"  Raw preview: {str(exec_res)[:500]}")
+            shared["errors"] = shared.get("errors", []) + [f"Code generator returned unparseable output for task {task.get('task_id', '?')}"]
             return "error"
         try:
             if not isinstance(files, list):
@@ -190,6 +205,8 @@ class TestGeneratorNode(Node):
         print("TestGeneratorNode")
         print("*" * 70)
         task = shared.get("current_task", {})
+        if not isinstance(task, dict):
+            task = {}
         output_dir = shared.get("output_dir", shared.get("workdir", "."))
         generated_files = shared.get("generated_files", [])
         task_id = task.get("task_id", "")
@@ -245,6 +262,9 @@ class TestGeneratorNode(Node):
             shared["generated_test_files"] = test_files
             return "default"
         parsed = parse_llm_json(exec_res)
+        if parsed is None:
+            shared["errors"] = shared.get("errors", []) + ["Test generator returned invalid JSON"]
+            return "error"
         try:
             if isinstance(parsed, list):
                 shared["generated_test_files"] = parsed
@@ -277,6 +297,8 @@ class TestExecutorNode(Node):
             return json.dumps([])
         results = []
         for test_file in test_files:
+            if not isinstance(test_file, dict):
+                continue
             test_path, target_file = test_file.get("path", ""), test_file.get("target_file", "")
             exit_code, stdout, stderr = run_yarn_command(["vitest", "run", test_path, "--reporter=verbose"], cwd=output_dir, timeout=180)
             cov_exit, cov_stdout, cov_stderr = run_yarn_command(["vitest", "run", test_path, "--coverage", "--reporter=verbose"], cwd=output_dir, timeout=180)
@@ -287,6 +309,9 @@ class TestExecutorNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         parsed = parse_llm_json(exec_res)
+        if parsed is None:
+            shared["errors"] = shared.get("errors", []) + ["Test executor returned invalid JSON"]
+            return "error"
         if not isinstance(parsed, list):
             shared["errors"] = shared.get("errors", []) + ["Test executor returned unexpected format"]
             return "error"
@@ -295,7 +320,11 @@ class TestExecutorNode(Node):
         # ── FIX: empty list is NOT "all passed" unless tests are genuinely not required ──
         if not parsed:
             task = shared.get("current_task", {})
+            if not isinstance(task, dict):
+                task = {}
             test_req = task.get("test_requirements", {})
+            if not isinstance(test_req, dict):
+                test_req = {}
             tests_required = (
                 test_req.get("unit_tests", False)
                 or test_req.get("integration_tests", False)
@@ -313,7 +342,7 @@ class TestExecutorNode(Node):
             shared["_all_tests_passed"] = True
             return "all_passed"
 
-        all_passed = all(r.get("passed", False) for r in parsed)
+        all_passed = all(r.get("passed", False) for r in parsed if isinstance(r, dict))
         shared["_all_tests_passed"] = all_passed
         if all_passed:
             return "all_passed"
@@ -334,6 +363,8 @@ class CodeRepairNode(Node):
         print("CodeRepairNode")
         print("*" * 70)
         task = shared.get("current_task", {})
+        if not isinstance(task, dict):
+            task = {}
         task_id = task.get("task_id", "unknown")
         repair_key = f"_code_repair_state_{task_id}"
         repair_state = shared.get(repair_key, {
@@ -480,7 +511,10 @@ class TestRepairNode(Node):
     def prep(self, shared):
         print("TestRepairNode")
         print("*" * 70)
-        task_id = shared.get("current_task", {}).get("task_id", "unknown")
+        current_task = shared.get("current_task", {})
+        if not isinstance(current_task, dict):
+            current_task = {}
+        task_id = current_task.get("task_id", "unknown")
         repair_key = f"_test_repair_state_{task_id}"
         repair_state = shared.get(repair_key, {"attempt": 0, "last_failure_fingerprint": None, "last_test_hash": None, "stuck_count": 0, "source_flip_count": 0, "strategies_tried": []})
         test_files, test_results, source_files = shared.get("generated_test_files", []), shared.get("test_results", []), shared.get("generated_files", [])
@@ -507,8 +541,8 @@ class TestRepairNode(Node):
         if prep_res.get("source_fix_needed"):
             return json.dumps({"source_fix_needed": True, "reason": prep_res["reason"], "task_id": prep_res["task_id"]})
         task_id, strategy = prep_res["task_id"], prep_res["strategy"]
-        test_file_map = {t.get("path", ""): t for t in prep_res["test_files"]}
-        source_file_map = {s.get("path", ""): s for s in prep_res["source_files"]}
+        test_file_map = {t.get("path", ""): t for t in prep_res["test_files"] if isinstance(t, dict)}
+        source_file_map = {s.get("path", ""): s for s in prep_res["source_files"] if isinstance(s, dict)}
         print(f"[TestRepairNode] Strategy: {strategy} for {task_id} (attempt {prep_res['repair_state']['attempt']})")
         if strategy == "holistic":
             return exec_holistic_test_repair(prep_res, test_file_map, source_file_map)
@@ -546,12 +580,14 @@ class TaskFinalizerNode(Node):
         print("TaskFinalizerNode")
         print("*" * 70)
         task = shared.get("current_task", {})
+        if not isinstance(task, dict):
+            task = {}
         task_id = task.get("task_id", "unknown")
         return {
             "task_id": task_id,
             "task_title": task.get("title", ""),
-            "generated_files": [f.get("path", "") for f in shared.get("generated_files", [])],
-            "test_files": [f.get("path", "") for f in shared.get("generated_test_files", [])],
+            "generated_files": [f.get("path", "") for f in shared.get("generated_files", []) if isinstance(f, dict)],
+            "test_files": [f.get("path", "") for f in shared.get("generated_test_files", []) if isinstance(f, dict)],
             "output_dir": shared.get("output_dir", shared.get("workdir", ".")),
         }
 
@@ -584,6 +620,8 @@ class TaskFinalizerNode(Node):
 
         # Update task status in the tasks list
         for t in shared.get("tasks", []):
+            if not isinstance(t, dict):
+                continue
             if t.get("task_id") == task_id:
                 t["status"] = "completed"
                 break

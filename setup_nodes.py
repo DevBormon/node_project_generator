@@ -71,6 +71,9 @@ class SetupPlannerNode(Node):
             return "skip"
         shared["_setup_planner_raw"] = exec_res
         parsed = parse_llm_json(exec_res)
+        if parsed is None:
+            shared["errors"] = shared.get("errors", []) + ["Setup planner returned invalid JSON"]
+            return "error"
         if not isinstance(parsed, list) or not parsed:
             shared["errors"] = shared.get("errors", []) + ["Setup planner returned empty or invalid file list"]
             return "error"
@@ -164,6 +167,9 @@ class SetupFileGeneratorNode(Node):
             return "next"
         shared["_setup_filegen_raw"] = exec_res
         parsed = parse_llm_json(exec_res)
+        if parsed is None:
+            shared["errors"] = shared.get("errors", []) + [f"Setup file generator returned invalid JSON for {prep_res['file']['path']}"]
+            return "error"
         if not isinstance(parsed, dict) or "path" not in parsed or "content" not in parsed:
             shared["errors"] = shared.get("errors", []) + [f"Invalid output format for {prep_res['file']['path']}"]
             return "error"
@@ -382,6 +388,9 @@ class YarnInstallNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         result = safe_json_loads(exec_res, {})
+        if not isinstance(result, dict):
+            shared["errors"] = shared.get("errors", []) + ["Yarn install returned invalid response format"]
+            return "error"
         if prep_res.get("permanent_failure"):
             return "next"
         if result.get("skipped"):

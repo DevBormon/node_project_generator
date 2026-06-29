@@ -47,10 +47,10 @@ PM_PROMPT = """You are a Senior Product Manager writing the strategic foundation
 
 Rules:
 - Problem statement: 2-3 sentences, user-centric, no solution language
-- Goals: Max 5, each measurable or with clear done criteria
-- Non-goals: At least 3 explicit scope boundaries
-- Success metrics: At least one business + one user metric
-- Stakeholders: MUST be a JSON object with these exact keys and string values:
+- Goals: Array of strings, max 5, each measurable or with clear done criteria
+- Non-goals: Array of strings, at least 3 explicit scope boundaries
+- Success metrics: Array of strings, at least one business + one user metric
+- Stakeholders: MUST be a JSON object with these EXACT keys and string values:
     {
       "decision_maker": "Description of who makes go/no-go decisions",
       "end_users": "Description of primary users who interact with the system",
@@ -59,34 +59,57 @@ Rules:
   CRITICAL: stakeholders MUST be an object/dict, NOT a list/array.
   WRONG: "stakeholders": ["CEO", "Users"]  
   RIGHT: "stakeholders": {"decision_maker": "CEO", "end_users": "Job seekers", "blockers": "Legal team"}
-- Assumptions: List of strings, things we assume to be true for this project
+- Assumptions: Array of strings
 
-Output JSON: {problem_statement, goals, non_goals, success_metrics, stakeholders, assumptions}"""
+Output JSON with EXACT structure:
+{
+  "problem_statement": "...",
+  "goals": ["Goal 1", "Goal 2"],
+  "non_goals": ["Out of scope 1", "Out of scope 2"],
+  "success_metrics": ["Metric 1", "Metric 2"],
+  "stakeholders": {"decision_maker": "...", "end_users": "...", "blockers": "..."},
+  "assumptions": ["We assume users have internet access"]
+}"""
 
 
 UX_PROMPT = """You are a UX Designer defining user scenarios.
 
 Rules:
-- Personas: 2-3 primary (name, role, goal, pain point, tech proficiency)
-- Scenarios: Given/When/Then format. Happy path + 2 edge cases per persona
-- Key flows: 3-5 critical journeys with entry/exit criteria
+- Personas: Array of objects. Each: {"name": "...", "role": "...", "goal": "...", "pain_point": "...", "tech_proficiency": "..."}
+- Scenarios: Array of objects. Each: {"given": "...", "when": "...", "then": "...", "persona": "persona_name"}
+- Key flows: Array of objects. Each: {"name": "...", "entry_criteria": "...", "exit_criteria": "...", "steps": ["..."]}
+- Edge cases: Array of strings
 - No UI specifics — focus on interaction logic
 - Output ONLY JSON. No markdown, no explanation.
 
-Output JSON: {personas, scenarios, key_flows, edge_cases}"""
+Output JSON with EXACT structure:
+{
+  "personas": [{"name": "Alice", "role": "Job Seeker", "goal": "Find a job", "pain_point": "...", "tech_proficiency": "high"}],
+  "scenarios": [{"given": "...", "when": "...", "then": "...", "persona": "Alice"}],
+  "key_flows": [{"name": "Job Application", "entry_criteria": "...", "exit_criteria": "...", "steps": ["Browse jobs", "Apply"]}],
+  "edge_cases": ["User applies with expired subscription"]
+}"""
 
 
 BA_PROMPT = """You are a Senior Business Analyst writing detailed requirements.
 
 Rules:
-- Functional requirements: Numbered (REQ-001...), testable/verifiable
-- Use "shall" for mandatory, "should" for preferred
-- Non-functional: performance, security, scalability, availability
-- Data requirements: inputs, outputs, storage, retention
-- Integration points: direction (inbound/outbound), protocol
+- Functional requirements: Array of objects. Each: {"id": "REQ-001", "description": "...", "priority": "shall|should"}
+- Non-functional: Array of strings
+- Data requirements: Array of objects. Each: {"entity": "PascalCaseSingular", "inputs": "...", "outputs": "...", "storage": "...", "retention": "..."}
+  CRITICAL: entity names MUST be PascalCase singular (e.g. "User", "JobListing", "Company") — these feed directly into the domain model
+- Integration points: Array of objects. Each: {"system": "...", "protocol": "...", "direction": "inbound|outbound"}
+- requirement_scenario_map: Dict mapping requirement IDs to arrays of scenario names. Example: {"REQ-001": ["User logs in"], "REQ-002": ["User registers", "Admin registers user"]}
 - Map each requirement to at least one scenario
 
-Output JSON: {functional_requirements, non_functional_requirements, data_requirements, integration_points, requirement_scenario_map}"""
+Output JSON with EXACT structure:
+{
+  "functional_requirements": [{"id": "REQ-001", "description": "...", "priority": "shall"}],
+  "non_functional_requirements": ["System shall handle 1000 concurrent users"],
+  "data_requirements": [{"entity": "User", "inputs": "...", "outputs": "...", "storage": "MySQL", "retention": "7 years"}],
+  "integration_points": [{"system": "PaymentGateway", "protocol": "REST", "direction": "outbound"}],
+  "requirement_scenario_map": {"REQ-001": ["User login flow"]}
+}"""
 
 
 REVIEW_PROMPT = """You are a Principal Engineer reviewing for technical feasibility and spec quality.
@@ -122,7 +145,7 @@ Rules:
 - Include version, date, author placeholder
 - Self-contained: new reader understands full context
 
-Output as clean Markdown with YAML frontmatter OR structured JSON."""
+Output ONLY valid JSON with all business specification sections. No markdown, no YAML frontmatter, no explanations outside JSON."""
 
 
 ARCHITECT_PROMPT = f"""You are a Principal Solutions Architect. Design the system architecture based on the business specification.
@@ -172,7 +195,8 @@ MANDATORY TECHNOLOGY STACK:
 - Validation: {TECH_STACK['validation']} (Zod 4.x)
 
 Rules:
-- Identify all entities, value objects, aggregates, and domain services from business spec.
+- Aggregate names MUST match data_entities from the BA section EXACTLY (PascalCase singular: "User", "JobListing", "Company")
+- Do NOT invent new aggregate names not present in the BA data_requirements entity list
 - Define aggregate roots with clear boundaries. Each aggregate has one root.
 - Specify entity attributes: name, TypeScript type, TypeORM decorators (@Entity, @Column, @PrimaryGeneratedColumn, @ManyToOne, etc.), constraints, business invariants.
 - Map relationships: one-to-one, one-to-many, many-to-many. Specify TypeORM relation decorators and ownership direction.
@@ -203,6 +227,8 @@ MANDATORY TECHNOLOGY STACK:
 - Language: {TECH_STACK['language']} (TypeScript 5.x)
 
 Rules:
+- Endpoint paths MUST reflect domain model aggregate names in kebab-case plural
+  Example: Aggregate "JobListing" → path "/api/v1/job-listings", Aggregate "Company" → path "/api/v1/companies"
 - RESTful API design using Express.js 5.x routers. Group by bounded context.
 - Define all endpoints: path, HTTP method, Express handler signature, request/response Zod schemas, status codes.
 - Use Zod 4.x for request validation (body, query, params). Export inferred TypeScript types from Zod schemas.
@@ -238,6 +264,9 @@ MANDATORY TECHNOLOGY STACK:
 - Language: {TECH_STACK['language']} (TypeScript 5.x)
 
 Rules:
+- Table names MUST be snake_case plural of domain model aggregate names
+  Example: Aggregate "JobListing" → table "job_listings", Aggregate "Company" → table "companies"
+- Every aggregate in the domain model MUST have a matching table
 - MySQL 8.x per bounded context. TypeORM 0.3.x entity definitions with decorators.
 - Schema design: tables, columns with TypeORM @Column types, primary keys (@PrimaryGeneratedColumn), indexes (@Index), foreign keys (@ManyToOne with @JoinColumn), constraints.
 - Data access patterns: read-heavy vs. write-heavy, query patterns, aggregation needs. Specify TypeORM Repository vs QueryBuilder usage.
@@ -479,7 +508,7 @@ Rules:
 - Include "Quick Start" section: Docker compose up, npm install, npm run dev, key Express routes, TypeORM migration run.
 - Include "Stack Rationale" section: why Node.js 24 LTS + TypeScript 5.x + Express.js 5.x + MySQL 8.x + TypeORM 0.3.x + Memcached + Kafka + jose + argon2 + Zod 4.x + Vitest + Pino + OpenAPI 3.1 + Docker + GitHub Actions.
 
-Output as clean Markdown with YAML frontmatter."""
+Output ONLY valid JSON with all system specification sections. No markdown, no YAML frontmatter, no explanations outside JSON."""
 
 TASK_GENERATOR_PROMPT = f"""You are a Senior Technical Lead and Task Planner. Convert system specification sections into granular, actionable implementation tasks for a coding agent.
 
